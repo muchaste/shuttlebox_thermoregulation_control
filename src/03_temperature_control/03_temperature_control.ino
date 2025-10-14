@@ -182,10 +182,10 @@ void setHeatingRelay(bool state) {
     return;
   }
   
-  if (state && coolingRelay && !safetyOverride) {
-    Serial.println("ERROR:Cannot enable heating while cooling active");
-    return;
-  }
+  // if (state && coolingRelay && !safetyOverride) {
+  //   Serial.println("ERROR:Cannot enable heating while cooling active");
+  //   return;
+  // }
   
   if (state != heatingRelay) {
     heatingRelay = state;
@@ -205,10 +205,10 @@ void setCoolingRelay(bool state) {
     return;
   }
   
-  if (state && heatingRelay && !safetyOverride) {
-    Serial.println("ERROR:Cannot enable cooling while heating active");
-    return;
-  }
+  // if (state && heatingRelay && !safetyOverride) {
+  //   Serial.println("ERROR:Cannot enable cooling while heating active");
+  //   return;
+  // }
   
   if (state != coolingRelay) {
     coolingRelay = state;
@@ -227,10 +227,10 @@ void setBufferHeatingRelay(bool state) {
     return;
   }
   
-  if (state && bufferCoolingRelay && !safetyOverride) {
-    Serial.println("ERROR:Cannot enable buffer heating while buffer cooling active");
-    return;
-  }
+  // if (state && bufferCoolingRelay && !safetyOverride) {
+  //   Serial.println("ERROR:Cannot enable buffer heating while buffer cooling active");
+  //   return;
+  // }
   
   if (state != bufferHeatingRelay) {
     bufferHeatingRelay = state;
@@ -249,10 +249,10 @@ void setBufferCoolingRelay(bool state) {
     return;
   }
   
-  if (state && bufferHeatingRelay && !safetyOverride) {
-    Serial.println("ERROR:Cannot enable buffer cooling while buffer heating active");
-    return;
-  }
+  // if (state && bufferHeatingRelay && !safetyOverride) {
+  //   Serial.println("ERROR:Cannot enable buffer cooling while buffer heating active");
+  //   return;
+  // }
   
   if (state != bufferCoolingRelay) {
     bufferCoolingRelay = state;

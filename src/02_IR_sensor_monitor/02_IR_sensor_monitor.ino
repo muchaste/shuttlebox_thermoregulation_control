@@ -16,6 +16,7 @@
 // === Configuration ===
 #define DELAY_TIME 2000 // Delay in ms after both barriers are clear before position report
 #define HEARTBEAT_INTERVAL 5000 // Heartbeat every 5 seconds
+#define SENSOR_UPDATE_INTERVAL_MS 500 // Send sensor states every 1 second
 
 // === Pin Assignments ===
 const int leftSensors[] = {2, 3, 4, 5, 6};
@@ -51,6 +52,7 @@ int lastReportedPosition = -1; // -1=none, 0=passage, 1=left, 2=right
 unsigned long now;
 unsigned long lastUpdateTime = 0;
 unsigned long lastHeartbeat = 0;
+unsigned long lastSensorReport = 0;
 
 // === Serial Input Handling ===
 String serialBuffer = "";
@@ -100,6 +102,9 @@ void loop() {
   
   // Update sensor states
   updateSensorStates();
+  
+  // Send periodic sensor state updates
+  sendSensorUpdates();
   
   // Send heartbeat
   sendHeartbeat();
@@ -251,9 +256,27 @@ void handlePositionLogic(bool newLeftAllClear, bool newRightAllClear) {
 
 void reportPosition(int position) {
   if (position != lastReportedPosition) {
+    Serial.print("POSITION:");
     Serial.println(position);
     lastReportedPosition = position;
   }
+}
+
+void sendSensorStates() {
+  // Send individual sensor states for visualization
+  Serial.print("SENSORS:");
+  
+  // Send left sensors (5 sensors)
+  for (int i = 0; i < numLeftSensors; i++) {
+    Serial.print(leftSensorStatus[i] ? "1" : "0");
+  }
+  
+  // Send right sensors (5 sensors)  
+  for (int i = 0; i < numRightSensors; i++) {
+    Serial.print(rightSensorStatus[i] ? "1" : "0");
+  }
+  
+  Serial.println();
 }
 
 void handleSerialInput() {
@@ -345,6 +368,14 @@ void resetSystem() {
   
   // Report initial position
   reportInitialPosition();
+}
+
+void sendSensorUpdates() {
+  // Send sensor states periodically for visualization
+  if (now - lastSensorReport >= SENSOR_UPDATE_INTERVAL_MS) {
+    sendSensorStates();
+    lastSensorReport = now;
+  }
 }
 
 void sendHeartbeat() {
