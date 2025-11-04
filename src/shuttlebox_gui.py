@@ -1843,6 +1843,8 @@ class ShuttleboxGUI:
             fish_position = self.get_current_fish_position()
             
             # Fish position based control
+            # Only change heating/cooling when fish is on a side (completes side change)
+            # Maintain current state when fish is in passage
             if fish_position == 2:  # Right side (warm)
                 # Fish is on warm side - activate heating, deactivate cooling
                 self.temp_control_controller.set_heating(True)
@@ -1851,10 +1853,8 @@ class ShuttleboxGUI:
                 # Fish is on cold side - activate cooling, deactivate heating
                 self.temp_control_controller.set_cooling(True)
                 self.temp_control_controller.set_heating(False)
-            elif fish_position == 0:  # Passage
-                # Fish in passage - turn off both heating and cooling
-                self.temp_control_controller.set_heating(False)
-                self.temp_control_controller.set_cooling(False)
+            # elif fish_position == 0:  # Passage
+            #     # Fish in passage - maintain current heating/cooling state (do nothing)
             
             # Check temperature difference between sides
             actual_diff = abs(warm_avg - cold_avg)
