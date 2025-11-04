@@ -387,6 +387,7 @@ class ShuttleboxGUI:
         # Temperature control modes
         self.static_control_active = False
         self.dynamic_control_active = False
+        self.difference_control_active = False  # Active difference control in dynamic mode
         self.last_control_action = time.time()  # For hysteresis timing
         
         # Manual position control
@@ -597,12 +598,15 @@ class ShuttleboxGUI:
         
         self.static_control_btn = ttk.Button(control_mode_frame, text="Start Static Control", 
                                             command=self.toggle_static_control, state=tk.DISABLED)
-        self.static_control_btn.grid(row=current_row, column=0, columnspan=2, pady=10)
-        # self.static_control_btn.pack(side=tk.LEFT, padx=2)
+        self.static_control_btn.grid(row=0, column=0, padx=2, pady=5)
         
         self.dynamic_control_btn = ttk.Button(control_mode_frame, text="Start Dynamic Control", 
                                              command=self.toggle_dynamic_control, state=tk.DISABLED)
-        self.dynamic_control_btn.grid(row=current_row, column=2, columnspan=2, pady=10)
+        self.dynamic_control_btn.grid(row=0, column=1, padx=2, pady=5)
+        
+        self.difference_control_btn = ttk.Button(control_mode_frame, text="Difference Control", 
+                                               command=self.toggle_difference_control, state=tk.DISABLED)
+        self.difference_control_btn.grid(row=0, column=2, padx=2, pady=5)
         
         # Control status
         self.control_status_var = tk.StringVar(value="Manual Mode")
@@ -1375,9 +1379,14 @@ class ShuttleboxGUI:
         # Stop automated control modes
         self.static_control_active = False
         self.dynamic_control_active = False
+        self.difference_control_active = False
         self.control_status_var.set("Emergency Stop - Manual Mode")
         self.static_control_btn.config(text="Start Static Control")
         self.dynamic_control_btn.config(text="Start Dynamic Control")
+        self.difference_control_btn.config(text="Difference Control")
+        
+        # Update button states
+        self.update_button_states()
         
         messagebox.showinfo("Emergency Stop", "All temperature control systems stopped!")
     
@@ -1398,6 +1407,8 @@ class ShuttleboxGUI:
             self.static_control_btn.config(text="Start Static Control")
             # Turn off all controls
             self.temp_control_controller.emergency_stop()
+            # Update button states
+            self.update_button_states()
         else:
             # Start static control
             try:
@@ -1439,11 +1450,16 @@ class ShuttleboxGUI:
                 # Stop dynamic control if active
                 if self.dynamic_control_active:
                     self.dynamic_control_active = False
+                    self.difference_control_active = False  # Also stop difference control
                     self.dynamic_control_btn.config(text="Start Dynamic Control")
+                    self.difference_control_btn.config(text="Difference Control")
                 
                 self.static_control_active = True
                 self.control_status_var.set(f"Static Control: {start_side.title()} Side Start, {start_temp}°C ±{hysteresis}°C")
                 self.static_control_btn.config(text="Stop Static Control")
+                
+                # Update button states
+                self.update_button_states()
                 
             except ValueError as e:
                 messagebox.showerror("Error", f"Invalid control parameters: {e}")
@@ -1465,10 +1481,14 @@ class ShuttleboxGUI:
         if self.dynamic_control_active:
             # Stop dynamic control
             self.dynamic_control_active = False
+            self.difference_control_active = False  # Also stop difference control
             self.control_status_var.set("Manual Mode")
             self.dynamic_control_btn.config(text="Start Dynamic Control")
+            self.difference_control_btn.config(text="Difference Control")
             # Turn off all controls
             self.temp_control_controller.emergency_stop()
+            # Update button states
+            self.update_button_states()
         else:
             # Start dynamic control
             try:
@@ -1505,8 +1525,31 @@ class ShuttleboxGUI:
                 self.control_status_var.set(f"Dynamic Control: Following Fish Position, Target Diff={temp_diff}°C")
                 self.dynamic_control_btn.config(text="Stop Dynamic Control")
                 
+                # Update button states (enable difference control button)
+                self.update_button_states()
+                
             except ValueError as e:
                 messagebox.showerror("Error", f"Invalid control parameters: {e}")
+    
+    def toggle_difference_control(self):
+        """Toggle difference control mode (only available during dynamic control)"""
+        if not self.dynamic_control_active:
+            messagebox.showwarning("Warning", "Difference control only available during dynamic control")
+            return
+        
+        if self.difference_control_active:
+            # Stop difference control
+            self.difference_control_active = False
+            self.difference_control_btn.config(text="Difference Control")
+        else:
+            # Start difference control
+            self.difference_control_active = True
+            self.difference_control_btn.config(text="Stop Diff Control")
+            
+        # Update status display
+        temp_diff = float(self.temp_diff_var.get())
+        diff_status = " + Diff Control" if self.difference_control_active else ""
+        self.control_status_var.set(f"Dynamic Control: Following Fish Position, Target Diff={temp_diff}°C{diff_status}")
     
     def get_warm_side_average(self):
         """Calculate average temperature of warm side channels using latest stored data"""
@@ -1842,37 +1885,90 @@ class ShuttleboxGUI:
             # Get current fish position (with manual override support)
             fish_position = self.get_current_fish_position()
             
-            # Fish position based control
-            # Only change heating/cooling when fish is on a side (completes side change)
-            # Maintain current state when fish is in passage
-            if fish_position == 2:  # Right side (warm)
-                # Fish is on warm side - activate heating, deactivate cooling
-                self.temp_control_controller.set_heating(True)
-                self.temp_control_controller.set_cooling(False)
-            elif fish_position == 1:  # Left side (cold)
-                # Fish is on cold side - activate cooling, deactivate heating
-                self.temp_control_controller.set_cooling(True)
-                self.temp_control_controller.set_heating(False)
-            # elif fish_position == 0:  # Passage
-            #     # Fish in passage - maintain current heating/cooling state (do nothing)
-            
-            # Check temperature difference between sides
+            # Calculate actual temperature difference
             actual_diff = abs(warm_avg - cold_avg)
-            if actual_diff > temp_diff + hysteresis:
-                # Temperature difference too large - activate buffer tanks
-                self.temp_control_controller.set_buffer_heating(True)
-                self.temp_control_controller.set_buffer_cooling(True)
-            elif actual_diff < temp_diff:
-                # Temperature difference acceptable - turn off buffer tanks
-                self.temp_control_controller.set_buffer_heating(False)
-                self.temp_control_controller.set_buffer_cooling(False)
+            
+            # Control logic: prioritize difference control when active
+            if self.difference_control_active:
+                # Active difference control mode
+                if actual_diff < temp_diff:
+                    # Temperature difference too small - activate opposing control to increase difference
+                    # Get current relay states first to avoid conflicts
+                    relay_states = self.temp_control_controller.get_status()
+                    current_heating = relay_states.get("HEAT", False)
+                    current_cooling = relay_states.get("COOL", False)
+                    
+                    # Fish position determines primary control, then add opposing control
+                    if fish_position == 2:  # Right side (warm) - primary heating
+                        self.temp_control_controller.set_heating(True)
+                        if not current_cooling:  # Add cooling to increase difference
+                            self.temp_control_controller.set_cooling(True)
+                    elif fish_position == 1:  # Left side (cold) - primary cooling
+                        self.temp_control_controller.set_cooling(True)
+                        if not current_heating:  # Add heating to increase difference
+                            self.temp_control_controller.set_heating(True)
+                    elif fish_position == 0:  # Passage - maintain current state but ensure difference
+                        if current_heating and not current_cooling:
+                            self.temp_control_controller.set_cooling(True)
+                        elif current_cooling and not current_heating:
+                            self.temp_control_controller.set_heating(True)
+                        # If both or neither are active, maintain current state
+                
+                elif actual_diff > temp_diff + hysteresis:
+                    # Temperature difference too large - use standard dynamic control + buffer tanks
+                    if fish_position == 2:  # Right side (warm) - keep heating, stop cooling
+                        self.temp_control_controller.set_heating(True)
+                        self.temp_control_controller.set_cooling(False)
+                    elif fish_position == 1:  # Left side (cold) - keep cooling, stop heating
+                        self.temp_control_controller.set_cooling(True)
+                        self.temp_control_controller.set_heating(False)
+                    # Activate buffer tanks for extreme differences
+                    self.temp_control_controller.set_buffer_heating(True)
+                    self.temp_control_controller.set_buffer_cooling(True)
+                else:
+                    # Difference is in acceptable range - use standard fish position control
+                    if fish_position == 2:  # Right side (warm)
+                        self.temp_control_controller.set_heating(True)
+                        self.temp_control_controller.set_cooling(False)
+                    elif fish_position == 1:  # Left side (cold)
+                        self.temp_control_controller.set_cooling(True)
+                        self.temp_control_controller.set_heating(False)
+                    # Turn off buffer tanks when difference is acceptable
+                    self.temp_control_controller.set_buffer_heating(False)
+                    self.temp_control_controller.set_buffer_cooling(False)
+                    
+            else:
+                # Standard dynamic control - fish position based control only
+                # Only change heating/cooling when fish is on a side (completes side change)
+                # Maintain current state when fish is in passage
+                if fish_position == 2:  # Right side (warm)
+                    # Fish is on warm side - activate heating, deactivate cooling
+                    self.temp_control_controller.set_heating(True)
+                    self.temp_control_controller.set_cooling(False)
+                elif fish_position == 1:  # Left side (cold)
+                    # Fish is on cold side - activate cooling, deactivate heating
+                    self.temp_control_controller.set_cooling(True)
+                    self.temp_control_controller.set_heating(False)
+                # elif fish_position == 0:  # Passage
+                #     # Fish in passage - maintain current heating/cooling state (do nothing)
+                
+                # Standard dynamic control - buffer tanks for extreme differences only
+                if actual_diff > temp_diff + hysteresis:
+                    # Temperature difference too large - activate buffer tanks
+                    self.temp_control_controller.set_buffer_heating(True)
+                    self.temp_control_controller.set_buffer_cooling(True)
+                elif actual_diff < temp_diff:
+                    # Temperature difference acceptable - turn off buffer tanks
+                    self.temp_control_controller.set_buffer_heating(False)
+                    self.temp_control_controller.set_buffer_cooling(False)
             
             # Update status with current readings and fish position
             position_names = {0: "Passage", 1: "Left (Cool)", 2: "Right (Warm)"}
             position_name = position_names.get(fish_position, "Unknown")
+            diff_status = " + Diff Control" if self.difference_control_active else ""
             status_text = (f"Dynamic Control: Fish at {position_name}, "
                           f"W={warm_avg:.1f}°C, C={cold_avg:.1f}°C, "
-                          f"Diff={actual_diff:.1f}°C (target {temp_diff:.1f}°C)")
+                          f"Diff={actual_diff:.1f}°C (target {temp_diff:.1f}°C){diff_status}")
             self.control_status_var.set(status_text)
             
         except Exception as e:
@@ -2068,6 +2164,12 @@ class ShuttleboxGUI:
             self.dynamic_control_btn.config(state=tk.NORMAL)
         else:
             self.dynamic_control_btn.config(state=tk.DISABLED)
+        
+        # Difference control: only available when dynamic control is active
+        if self.dynamic_control_active:
+            self.difference_control_btn.config(state=tk.NORMAL)
+        else:
+            self.difference_control_btn.config(state=tk.DISABLED)
     
     def update_monitoring_button_state(self):
         """Legacy method - redirects to update_button_states for compatibility"""
