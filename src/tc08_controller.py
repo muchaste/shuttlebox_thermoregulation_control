@@ -9,7 +9,7 @@ Key Features:
 - Comprehensive error handling and validation
 - Clean API for GUI integration
 
-Author: Shuttlebox Control System
+Author: Stefan Mucha, Claude Sonnet 4.0
 Version: 1.0
 """
 
@@ -22,6 +22,9 @@ from datetime import datetime
 import logging
 from picosdk.usbtc08 import usbtc08 as tc08
 from picosdk.functions import assert_pico2000_ok
+import json
+import os
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -48,10 +51,7 @@ class TC08Config:
     max_buffer_size: int = 100       # Maximum readings per channel call
 
 class TC08Controller:
-    """
-    Main controller class for TC-08 temperature data acquisition
-    Designed for integration with GUI applications
-    """
+    """Main controller class for TC-08 temperature data acquisition"""
     
     def __init__(self, config: TC08Config):
         self.config = config
@@ -60,6 +60,11 @@ class TC08Controller:
         self.connected = False
         self.streaming = False
         self._lock = threading.Lock()
+        
+        # Add health monitoring
+        self.health_monitor = TC08HealthMonitor()
+        self._health_logging_timer = None
+        self._health_logging_active = False
         
         # Thermocouple type mapping
         self._tc_types = {
@@ -70,7 +75,7 @@ class TC08Controller:
         
         # Validate configuration
         self._validate_config()
-        
+    
     def _validate_config(self):
         """Validate configuration parameters"""
         if not self.config.channels:
@@ -86,36 +91,44 @@ class TC08Controller:
             raise ValueError("Sample interval must be at least 100ms")
     
     def connect(self) -> bool:
-        """
-        Connect to TC-08 device and configure channels
-        Returns: True if successful, False otherwise
-        """
+        """Connect to TC-08 device and configure channels"""
         with self._lock:
             try:
                 if self.connected:
                     logger.warning("Already connected to TC-08")
                     return True
                 
+                # Log connection attempt
+                self.health_monitor.log_connection_event("connect_attempt", True, {
+                    "channels": self.config.channels,
+                    "sample_interval_ms": self.config.sample_interval_ms
+                })
+                
                 # Open device
                 self.status["open_unit"] = tc08.usb_tc08_open_unit()
                 assert_pico2000_ok(self.status["open_unit"])
-                self.chandle = self.status["open_unit"]
-                logger.info(f"TC-08 device opened with handle: {self.chandle}")
+                self.chandle.value = self.status["open_unit"]
+                
+                # Log successful device open
+                self.health_monitor.log_connection_event("device_opened", True, {
+                    "handle_value": int(self.chandle.value)
+                })
+                
+                logger.info(f"TC-08 device opened with handle: {self.chandle.value}")
                 
                 # Set mains rejection (50Hz for EU, 60Hz for US)
-                self.status["set_mains"] = tc08.usb_tc08_set_mains(self.chandle, 0)  # 0=50Hz
+                self.status["set_mains"] = tc08.usb_tc08_set_mains(self.chandle.value, 0)
                 assert_pico2000_ok(self.status["set_mains"])
                 
                 # Configure channels
                 tc_type = self._tc_types[self.config.thermocouple_type]
                 for channel in self.config.channels:
                     status_key = f"set_channel_{channel}"
-                    self.status[status_key] = tc08.usb_tc08_set_channel(self.chandle, channel, tc_type)
+                    self.status[status_key] = tc08.usb_tc08_set_channel(self.chandle.value, channel, tc_type)
                     assert_pico2000_ok(self.status[status_key])
-                    logger.info(f"Configured channel {channel} for {self.config.thermocouple_type}-type thermocouple")
                 
                 # Get and validate minimum sampling interval
-                self.status["get_minimum_interval_ms"] = tc08.usb_tc08_get_minimum_interval_ms(self.chandle)
+                self.status["get_minimum_interval_ms"] = tc08.usb_tc08_get_minimum_interval_ms(self.chandle.value)
                 assert_pico2000_ok(self.status["get_minimum_interval_ms"])
                 
                 min_interval = self.status["get_minimum_interval_ms"]
@@ -124,12 +137,27 @@ class TC08Controller:
                     self.config.sample_interval_ms = min_interval
                 
                 self.connected = True
-                logger.info(f"TC-08 connected successfully. Channels: {self.config.channels}, "
-                           f"Min interval: {min_interval}ms, Using: {self.config.sample_interval_ms}ms")
                 
+                # Log successful connection
+                self.health_monitor.log_connection_event("connect_success", True, {
+                    "min_interval_ms": min_interval,
+                    "actual_interval_ms": self.config.sample_interval_ms
+                })
+                
+                logger.info(f"TC-08 connected successfully. Channels: {self.config.channels}")
                 return True
                 
             except Exception as e:
+                # Log connection failure with full details
+                self.health_monitor.log_connection_event("connect_failed", False, {
+                    "error": str(e),
+                    "status_codes": dict(self.status)
+                })
+                self.health_monitor.log_error(f"Connection failed: {e}", {
+                    "channels": self.config.channels,
+                    "status": dict(self.status)
+                })
+                
                 logger.error(f"Failed to connect TC-08: {e}")
                 self._cleanup_connection()
                 return False
@@ -150,7 +178,7 @@ class TC08Controller:
                     return True
                 
                 # Start streaming mode
-                self.status["run"] = tc08.usb_tc08_run(self.chandle, self.config.sample_interval_ms)
+                self.status["run"] = tc08.usb_tc08_run(self.chandle.value, self.config.sample_interval_ms)
                 assert_pico2000_ok(self.status["run"])
                 
                 # Allow device to stabilize
@@ -174,7 +202,7 @@ class TC08Controller:
                 if not self.streaming:
                     return True
                 
-                self.status["stop"] = tc08.usb_tc08_stop(self.chandle)
+                self.status["stop"] = tc08.usb_tc08_stop(self.chandle.value)
                 assert_pico2000_ok(self.status["stop"])
                 
                 self.streaming = False
@@ -186,10 +214,7 @@ class TC08Controller:
                 return False
     
     def read_temperatures(self) -> Dict[int, TemperatureReading]:
-        """
-        Read current temperatures from all configured channels
-        Returns: Dictionary mapping channel number to TemperatureReading
-        """
+        """Read temperatures with error logging"""
         if not self.connected:
             raise RuntimeError("Device not connected")
         
@@ -199,11 +224,23 @@ class TC08Controller:
         readings = {}
         timestamp = datetime.now()
         
-        for channel in self.config.channels:
-            reading = self._read_single_channel(channel, timestamp)
-            readings[channel] = reading
-        
-        return readings
+        try:
+            for channel in self.config.channels:
+                reading = self._read_single_channel(channel, timestamp)
+                readings[channel] = reading
+                
+                # Log communication errors
+                if reading.error:
+                    self.health_monitor.log_error(f"Channel {channel} read error: {reading.error}")
+            
+            return readings
+            
+        except Exception as e:
+            self.health_monitor.log_error(f"Temperature read failed: {e}", {
+                "channels": self.config.channels,
+                "streaming": self.streaming
+            })
+            raise
     
     def _read_single_channel(self, channel: int, timestamp: datetime) -> TemperatureReading:
         """Read temperature from a single channel"""
@@ -215,7 +252,7 @@ class TC08Controller:
             
             # Read channel data
             readings_count = tc08.usb_tc08_get_temp(
-                self.chandle,
+                self.chandle.value,
                 ctypes.byref(temp_buffer),
                 ctypes.byref(times_ms_buffer),
                 self.config.max_buffer_size,
@@ -265,7 +302,7 @@ class TC08Controller:
             'sample_interval_ms': self.config.sample_interval_ms,
             'thermocouple_type': self.config.thermocouple_type,
             'min_interval_ms': self.status.get("get_minimum_interval_ms", None),
-            'handle': int(self.chandle) if self.connected else None
+            'handle': int(self.chandle.value) if self.connected else None
         }
     
     def disconnect(self) -> bool:
@@ -283,7 +320,7 @@ class TC08Controller:
                     self.stop_streaming()
                 
                 # Close device
-                self.status["close_unit"] = tc08.usb_tc08_close_unit(self.chandle)
+                self.status["close_unit"] = tc08.usb_tc08_close_unit(self.chandle.value)
                 assert_pico2000_ok(self.status["close_unit"])
                 
                 self._cleanup_connection()
@@ -299,8 +336,43 @@ class TC08Controller:
         """Clean up connection state"""
         self.connected = False
         self.streaming = False
+        self.stop_periodic_health_logging()
         self.chandle = ctypes.c_int16()
         self.status.clear()
+    
+    def start_periodic_health_logging(self, interval_minutes: int = 30):
+        """Start periodic health monitoring logs"""
+        if self._health_logging_active:
+            logger.warning("Health logging already active")
+            return
+        
+        self._health_logging_active = True
+        
+        def _periodic_health_check():
+            if self._health_logging_active:
+                try:
+                    self.health_monitor.log_health_check(self)
+                except Exception as e:
+                    logger.error(f"Health check failed: {e}")
+                
+                # Schedule next check
+                if self._health_logging_active:
+                    self._health_logging_timer = threading.Timer(
+                        interval_minutes * 60, _periodic_health_check
+                    )
+                    self._health_logging_timer.start()
+        
+        # Start first check
+        _periodic_health_check()
+        logger.info(f"Started periodic health logging every {interval_minutes} minutes")
+    
+    def stop_periodic_health_logging(self):
+        """Stop periodic health monitoring logs"""
+        self._health_logging_active = False
+        if self._health_logging_timer:
+            self._health_logging_timer.cancel()
+            self._health_logging_timer = None
+        logger.info("Stopped periodic health logging")
     
     def __enter__(self):
         """Context manager entry"""
@@ -370,6 +442,82 @@ class TC08DataLogger:
         """Clear all stored data"""
         with self._lock:
             self.data_history.clear()
+
+
+class TC08HealthMonitor:
+    """Diagnostic monitoring for TC-08 USB communication health"""
+    
+    def __init__(self, log_path: str = "tc08_diagnostics"):
+        self.log_path = Path(log_path)
+        self.log_path.mkdir(exist_ok=True)
+        self.health_log_file = self.log_path / "tc08_health.log"
+        self.error_log_file = self.log_path / "tc08_errors.log"
+        self.session_start = datetime.now()
+        
+    def log_health_check(self, controller_instance):
+        """Log USB communication health indicators"""
+        try:
+            timestamp = datetime.now()
+            health_data = {
+                'timestamp': timestamp.isoformat(),
+                'session_duration_hours': (timestamp - self.session_start).total_seconds() / 3600,
+                'connected': controller_instance.connected,
+                'streaming': controller_instance.streaming,
+                'handle_value': int(controller_instance.chandle.value) if controller_instance.chandle else 0,
+                'channels': controller_instance.config.channels,
+                'sample_interval_ms': controller_instance.config.sample_interval_ms,
+            }
+            
+            # Test basic device communication if connected
+            if controller_instance.connected and controller_instance.chandle.value != 0:
+                try:
+                    # Simple health check - get minimum interval
+                    min_interval = tc08.usb_tc08_get_minimum_interval_ms(controller_instance.chandle.value)
+                    health_data['min_interval_response'] = min_interval
+                    health_data['usb_communication'] = 'OK'
+                except Exception as e:
+                    health_data['usb_communication'] = f'FAILED: {str(e)}'
+                    health_data['min_interval_response'] = None
+            else:
+                health_data['usb_communication'] = 'DISCONNECTED'
+                health_data['min_interval_response'] = None
+            
+            # Append to health log
+            with open(self.health_log_file, 'a') as f:
+                f.write(f"{json.dumps(health_data)}\n")
+                
+        except Exception as e:
+            self.log_error(f"Health check failed: {e}")
+    
+    def log_error(self, error_message: str, additional_data: dict = None):
+        """Log TC-08 errors with context"""
+        try:
+            error_data = {
+                'timestamp': datetime.now().isoformat(),
+                'session_duration_hours': (datetime.now() - self.session_start).total_seconds() / 3600,
+                'error_message': str(error_message),
+                'additional_data': additional_data or {}
+            }
+            
+            with open(self.error_log_file, 'a') as f:
+                f.write(f"{json.dumps(error_data)}\n")
+                
+            logger.error(f"TC-08 Error logged: {error_message}")
+            
+        except Exception:
+            pass  # Don't let logging errors crash the system
+    
+    def log_connection_event(self, event_type: str, success: bool, details: dict = None):
+        """Log connection/disconnection events"""
+        event_data = {
+            'timestamp': datetime.now().isoformat(),
+            'event_type': event_type,
+            'success': success,
+            'details': details or {}
+        }
+        
+        with open(self.health_log_file, 'a') as f:
+            f.write(f"CONNECTION_EVENT: {json.dumps(event_data)}\n")
 
 
 # Example usage and testing

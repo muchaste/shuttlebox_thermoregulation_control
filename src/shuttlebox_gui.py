@@ -928,6 +928,9 @@ class ShuttleboxGUI:
             self.tc08_controller = TC08Controller(config)
             
             if self.tc08_controller.connect():
+                # Start periodic health logging for long experiments
+                self.tc08_controller.start_periodic_health_logging(interval_minutes=30)
+                
                 # Update temperature data storage for new channels
                 self.temperature_data = {ch: [] for ch in channels}
                 self.temperature_timestamps = {ch: [] for ch in channels}
@@ -1728,7 +1731,7 @@ class ShuttleboxGUI:
         """Recursively find the fish frame and add clear override button"""
         try:
             if (hasattr(widget, 'winfo_class') and 
-                hasattr(widget, 'cget') and 
+                hasattr(widget, 'cget') and
                 widget.cget('text') == 'Fish Position'):
                 
                 # Create clear override button
