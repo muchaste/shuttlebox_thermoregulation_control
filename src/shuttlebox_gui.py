@@ -1985,7 +1985,15 @@ class ShuttleboxGUI:
         try:
             # Update temperature data and plot (when TC-08 connected and plotting)
             if self.plotting_active and self.tc08_controller:
-                self.update_temperature_plot()
+                try:
+                    self.update_temperature_plot()
+                except RuntimeError as e:
+                    # TC-08 communication failure
+                    print(f"TC-08 communication error: {e}")
+                    self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="red")
+                    self.plotting_active = False
+                except Exception as e:
+                    print(f"Unexpected error updating temperature plot: {e}")
             
             # Record data point if recording is active
             if self.recording_active:
@@ -2266,7 +2274,20 @@ class ShuttleboxGUI:
     def update_temperature_plot(self):
         """Update temperature plot with new data and warm/cold averages"""
         try:
+            # Check if TC-08 is still properly connected
+            if not self.tc08_controller.connected:
+                print("TC-08 connection lost - stopping temperature plotting")
+                self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="orange")
+                return
+            
             readings = self.tc08_controller.read_temperatures()
+            
+            # Check if all readings failed (sign of USB communication failure)
+            valid_readings = sum(1 for r in readings.values() if not r.error)
+            if valid_readings == 0 and len(readings) > 0:
+                print("Warning: TC-08 returned no valid readings - possible USB communication degradation")
+                self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="orange")
+                return
             current_time = datetime.now()
             
             # Get plot period from user input
@@ -2390,8 +2411,54 @@ class ShuttleboxGUI:
                 
                 self.canvas.draw()
                 
+        except ValueError as e:
+            # Handle array shape mismatches from data gaps
+            if "shape mismatch" in str(e) or "broadcast" in str(e):
+                print(f"Plot array mismatch detected: {e}")
+                print("Attempting to synchronize data arrays...")
+                self._synchronize_plot_arrays()
+            else:
+                print(f"ValueError in temperature plot: {e}")
         except Exception as e:
-            pass  # Silently handle temperature plot update errors
+            print(f"Error updating temperature plot: {e}")
+    
+    def _synchronize_plot_arrays(self):
+        """Synchronize plotting arrays to handle length mismatches from data gaps"""
+        try:
+            # Find minimum length across all temperature arrays
+            min_length = float('inf')
+            
+            for ch in self.config.tc08_channels:
+                if len(self.temperature_data[ch]) > 0:
+                    min_length = min(min_length, len(self.temperature_data[ch]))
+                    min_length = min(min_length, len(self.temperature_timestamps[ch]))
+            
+            # Check average arrays
+            if len(self.warm_avg_data) > 0:
+                min_length = min(min_length, len(self.warm_avg_data))
+            if len(self.cold_avg_data) > 0:
+                min_length = min(min_length, len(self.cold_avg_data))
+            if len(self.avg_timestamps) > 0:
+                min_length = min(min_length, len(self.avg_timestamps))
+            
+            # If we found valid arrays, trim all to minimum length
+            if min_length != float('inf') and min_length > 0:
+                for ch in self.config.tc08_channels:
+                    self.temperature_data[ch] = self.temperature_data[ch][-min_length:]
+                    self.temperature_timestamps[ch] = self.temperature_timestamps[ch][-min_length:]
+                
+                self.warm_avg_data = self.warm_avg_data[-min_length:]
+                self.cold_avg_data = self.cold_avg_data[-min_length:]
+                self.avg_timestamps = self.avg_timestamps[-min_length:]
+                
+                # Also trim fish temperature data
+                if len(self.fish_temp_data) > min_length:
+                    self.fish_temp_data = self.fish_temp_data[-min_length:]
+                    self.fish_temp_timestamps = self.fish_temp_timestamps[-min_length:]
+                
+                print(f"Synchronized plot arrays to length {min_length}")
+        except Exception as e:
+            print(f"Error synchronizing plot arrays: {e}")
     
     def update_legend_with_temperatures(self):
         """Update plot legend to include current temperature values"""

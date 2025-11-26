@@ -307,38 +307,49 @@ class TC08Controller:
     
     def disconnect(self) -> bool:
         """
-        Disconnect from TC-08 device
+        Disconnect from TC-08 device with robust error handling
         Returns: True if successful, False otherwise
         """
         with self._lock:
-            try:
-                if not self.connected:
-                    return True
-                
-                # Stop streaming if active
-                if self.streaming:
-                    self.stop_streaming()
-                
-                # Close device
-                self.status["close_unit"] = tc08.usb_tc08_close_unit(self.chandle.value)
-                assert_pico2000_ok(self.status["close_unit"])
-                
-                self._cleanup_connection()
-                logger.info("TC-08 disconnected successfully")
+            if not self.connected:
                 return True
-                
+            
+            # Force stop streaming with error isolation
+            if self.streaming:
+                try:
+                    self.status["stop"] = tc08.usb_tc08_stop(self.chandle.value)
+                    # Don't assert here - continue with cleanup even if stop fails
+                    self.streaming = False
+                    logger.info("TC-08 streaming stopped")
+                except Exception as e:
+                    logger.warning(f"Error stopping streaming during disconnect: {e}")
+                    self.streaming = False  # Force flag reset
+            
+            # Force close device handle - this must happen regardless of streaming errors
+            try:
+                if self.chandle.value and self.chandle.value != 0:
+                    self.status["close_unit"] = tc08.usb_tc08_close_unit(self.chandle.value)
+                    # Log but don't raise - we want cleanup to complete
+                    if self.status["close_unit"] != 0:
+                        logger.info("TC-08 device handle closed")
+                    else:
+                        logger.warning(f"TC-08 close returned status: {self.status['close_unit']}")
             except Exception as e:
-                logger.error(f"Error during disconnect: {e}")
+                logger.error(f"Critical error during TC-08 handle close: {e}")
+            finally:
+                # Always cleanup state regardless of errors
                 self._cleanup_connection()
-                return False
+                logger.info("TC-08 disconnect cleanup completed")
+            
+            return True
     
     def _cleanup_connection(self):
-        """Clean up connection state"""
+        """Clean up connection state - force reset everything"""
         self.connected = False
         self.streaming = False
         self.stop_periodic_health_logging()
-        self.chandle = ctypes.c_int16()
-        self.status.clear()
+        self.chandle = ctypes.c_int16(0)  # Explicitly zero the handle
+        # Don't clear status - keep for diagnostics
     
     def start_periodic_health_logging(self, interval_minutes: int = 30):
         """Start periodic health monitoring logs"""
@@ -474,7 +485,13 @@ class TC08HealthMonitor:
                     # Simple health check - get minimum interval
                     min_interval = tc08.usb_tc08_get_minimum_interval_ms(controller_instance.chandle.value)
                     health_data['min_interval_response'] = min_interval
-                    health_data['usb_communication'] = 'OK'
+                    
+                    # Detect USB communication degradation
+                    if min_interval == 0:
+                        health_data['usb_communication'] = 'DEGRADED - device not responding properly'
+                        logger.warning("TC-08 USB communication degradation detected (min_interval=0)")
+                    else:
+                        health_data['usb_communication'] = 'OK'
                 except Exception as e:
                     health_data['usb_communication'] = f'FAILED: {str(e)}'
                     health_data['min_interval_response'] = None
