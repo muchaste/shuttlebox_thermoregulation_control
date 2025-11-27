@@ -66,6 +66,12 @@ class TC08Controller:
         self._health_logging_timer = None
         self._health_logging_active = False
         
+        # Track consecutive read failures for graduated response
+        self.consecutive_read_failures = 0
+        self.total_read_failures = 0
+        self.last_successful_read = None
+        self.last_failed_read = None
+        
         # Thermocouple type mapping
         self._tc_types = {
             'B': ctypes.c_int8(66), 'E': ctypes.c_int8(69), 'J': ctypes.c_int8(74),
@@ -137,6 +143,10 @@ class TC08Controller:
                     self.config.sample_interval_ms = min_interval
                 
                 self.connected = True
+                
+                # Reset failure counters on successful connection
+                self.consecutive_read_failures = 0
+                self.last_successful_read = datetime.now()
                 
                 # Log successful connection
                 self.health_monitor.log_connection_event("connect_success", True, {
@@ -214,7 +224,7 @@ class TC08Controller:
                 return False
     
     def read_temperatures(self) -> Dict[int, TemperatureReading]:
-        """Read temperatures with error logging"""
+        """Read temperatures with error logging and failure tracking"""
         if not self.connected:
             raise RuntimeError("Device not connected")
         
@@ -223,22 +233,45 @@ class TC08Controller:
         
         readings = {}
         timestamp = datetime.now()
+        failed_channels = 0
         
         try:
             for channel in self.config.channels:
                 reading = self._read_single_channel(channel, timestamp)
                 readings[channel] = reading
                 
-                # Log communication errors
+                # Count failed channels
                 if reading.error:
-                    self.health_monitor.log_error(f"Channel {channel} read error: {reading.error}")
+                    failed_channels += 1
+                    # Only log first occurrence and then every 10th to avoid log spam
+                    if self.consecutive_read_failures == 0 or self.total_read_failures % 10 == 0:
+                        self.health_monitor.log_error(f"Channel {channel} read error: {reading.error}")
+            
+            # Track failure patterns
+            if failed_channels == len(self.config.channels):
+                # All channels failed - likely transient EMI or USB issue
+                self.consecutive_read_failures += 1
+                self.total_read_failures += 1
+                self.last_failed_read = timestamp
+                
+                logger.warning(f"TC-08 missed reading #{self.consecutive_read_failures} "
+                             f"(total: {self.total_read_failures}) - all channels unavailable")
+            else:
+                # At least some channels worked - reset consecutive counter
+                if self.consecutive_read_failures > 0:
+                    logger.info(f"TC-08 recovered after {self.consecutive_read_failures} consecutive failures")
+                self.consecutive_read_failures = 0
+                self.last_successful_read = timestamp
             
             return readings
             
         except Exception as e:
+            self.consecutive_read_failures += 1
+            self.total_read_failures += 1
             self.health_monitor.log_error(f"Temperature read failed: {e}", {
                 "channels": self.config.channels,
-                "streaming": self.streaming
+                "streaming": self.streaming,
+                "consecutive_failures": self.consecutive_read_failures
             })
             raise
     
@@ -302,8 +335,23 @@ class TC08Controller:
             'sample_interval_ms': self.config.sample_interval_ms,
             'thermocouple_type': self.config.thermocouple_type,
             'min_interval_ms': self.status.get("get_minimum_interval_ms", None),
-            'handle': int(self.chandle.value) if self.connected else None
+            'handle': int(self.chandle.value) if self.connected else None,
+            'consecutive_failures': self.consecutive_read_failures,
+            'total_failures': self.total_read_failures,
+            'last_successful_read': self.last_successful_read,
+            'last_failed_read': self.last_failed_read
         }
+    
+    def needs_reconnection(self, failure_threshold: int = 5) -> bool:
+        """Check if device needs reconnection based on consecutive failures
+        
+        Args:
+            failure_threshold: Number of consecutive failures before reconnection needed
+        
+        Returns:
+            True if reconnection should be attempted
+        """
+        return self.consecutive_read_failures >= failure_threshold
     
     def disconnect(self) -> bool:
         """
@@ -506,14 +554,15 @@ class TC08HealthMonitor:
         except Exception as e:
             self.log_error(f"Health check failed: {e}")
     
-    def log_error(self, error_message: str, additional_data: dict = None):
-        """Log TC-08 errors with context"""
+    def log_error(self, error_message: str, additional_data: dict = None, relay_states: dict = None):
+        """Log TC-08 errors with context and relay state for EMI correlation"""
         try:
             error_data = {
                 'timestamp': datetime.now().isoformat(),
                 'session_duration_hours': (datetime.now() - self.session_start).total_seconds() / 3600,
                 'error_message': str(error_message),
-                'additional_data': additional_data or {}
+                'additional_data': additional_data or {},
+                'relay_states': relay_states  # Track relay switching for EMI correlation
             }
             
             with open(self.error_log_file, 'a') as f:

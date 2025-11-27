@@ -414,6 +414,13 @@ class ShuttleboxGUI:
         self._ir_warning_shown = False
         self._temp_warning_shown = False
         
+        # TC-08 auto-reconnection settings
+        self.tc08_auto_reconnect_enabled = True
+        self.tc08_failure_threshold = 5  # Reconnect after 5 consecutive failures
+        self.tc08_reconnection_in_progress = False
+        self.tc08_last_reconnection_attempt = None
+        self.tc08_reconnection_cooldown = 5  # Wait 5 seconds between reconnection attempts
+        
         self.create_widgets()
         self.refresh_com_ports()  # Initialize COM port lists
         self.update_monitoring_button_state()  # Set initial button state
@@ -534,6 +541,24 @@ class ShuttleboxGUI:
         self.tc08_status_canvas = tk.Canvas(tc08_frame, width=20, height=20, highlightthickness=0)
         self.tc08_status_canvas.grid(row=current_row, column=3, pady=5)
         self.tc08_status_circle = self.tc08_status_canvas.create_oval(2, 2, 18, 18, fill="red", outline="black")
+        current_row += 1
+        
+        # Auto-reconnection settings
+        reconnect_frame = ttk.Frame(tc08_frame)
+        reconnect_frame.grid(row=current_row, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
+        
+        self.auto_reconnect_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(reconnect_frame, text="Auto-reconnect on failure", 
+                       variable=self.auto_reconnect_var,
+                       command=self._update_auto_reconnect_setting).pack(side=tk.LEFT)
+        
+        ttk.Label(reconnect_frame, text="Threshold:").pack(side=tk.LEFT, padx=(10, 2))
+        self.failure_threshold_var = tk.StringVar(value="5")
+        threshold_entry = ttk.Entry(reconnect_frame, textvariable=self.failure_threshold_var, width=4)
+        threshold_entry.pack(side=tk.LEFT)
+        threshold_entry.bind('<FocusOut>', lambda e: self._update_auto_reconnect_setting())
+        
+        ttk.Label(reconnect_frame, text="failures").pack(side=tk.LEFT, padx=(2, 0))
         
         # Arduino Configuration Section
         arduino_frame = ttk.LabelFrame(parent, text="Arduino Configuration", padding="10")
@@ -879,6 +904,15 @@ class ShuttleboxGUI:
         
         self.sensor_canvas = sensor_canvas
     
+    def _update_auto_reconnect_setting(self):
+        """Update auto-reconnection settings from GUI controls"""
+        self.tc08_auto_reconnect_enabled = self.auto_reconnect_var.get()
+        try:
+            self.tc08_failure_threshold = int(self.failure_threshold_var.get())
+        except ValueError:
+            self.tc08_failure_threshold = 5  # Default fallback
+            self.failure_threshold_var.set("5")
+    
     def refresh_com_ports(self):
         """Refresh available COM ports and DAQ devices in dropdown menus"""
         try:
@@ -996,6 +1030,114 @@ class ShuttleboxGUI:
                 
         except Exception as e:
             messagebox.showerror("Error", f"TC-08 connection error: {str(e)}")
+    
+    def _attempt_tc08_auto_reconnect(self):
+        """Attempt automatic reconnection to TC-08 after repeated failures"""
+        if self.tc08_reconnection_in_progress:
+            print("TC-08 reconnection already in progress, skipping...")
+            return
+        
+        # Check cooldown period
+        if self.tc08_last_reconnection_attempt is not None:
+            time_since_last_attempt = time.time() - self.tc08_last_reconnection_attempt
+            if time_since_last_attempt < self.tc08_reconnection_cooldown:
+                print(f"TC-08 reconnection on cooldown ({time_since_last_attempt:.1f}s / {self.tc08_reconnection_cooldown}s)")
+                return
+        
+        self.tc08_reconnection_in_progress = True
+        self.tc08_last_reconnection_attempt = time.time()
+        
+        print("\n" + "="*60)
+        print("🔄 INITIATING TC-08 AUTO-RECONNECTION")
+        print(f"Reason: {self.tc08_controller.consecutive_read_failures} consecutive failed readings")
+        print("="*60)
+        
+        # Save current relay states to restore after reconnection
+        relay_states_before = None
+        if self.temp_control_controller and self.temp_control_controller.connected:
+            relay_states_before = self.temp_control_controller.get_status().copy()
+            print(f"📌 Preserved relay states: {relay_states_before}")
+        
+        # Save configuration
+        saved_config = {
+            'channels': [int(self.channel_vars[i].get()) for i in range(6) if self.channel_enable_vars[i].get()],
+            'channel_ids': [self.channel_id_vars[i].get() for i in range(6) if self.channel_enable_vars[i].get()],
+            'interval_ms': int(self.tc08_interval_var.get())
+        }
+        
+        try:
+            # Step 1: Disconnect
+            print("\n[Step 1/4] Disconnecting TC-08...")
+            if self.tc08_controller:
+                self.tc08_controller.disconnect()
+                self.tc08_controller = None
+            self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="orange")
+            print("✓ Disconnected")
+            
+            # Step 2: Wait for USB to stabilize
+            print("\n[Step 2/4] Waiting 5 seconds for USB stabilization...")
+            time.sleep(5)
+            print("✓ USB stabilization complete")
+            
+            # Step 3: Reconnect
+            print("\n[Step 3/4] Reconnecting TC-08...")
+            tc08_config = TC08Config(
+                channels=saved_config['channels'],
+                sample_interval_ms=saved_config['interval_ms']
+            )
+            
+            self.tc08_controller = TC08Controller(tc08_config)
+            
+            if self.tc08_controller.connect():
+                print("✓ TC-08 reconnected successfully")
+                self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="green")
+                
+                # Restart streaming
+                self.tc08_controller.start_streaming()
+                
+                # Reconfigure plot
+                self.update_plot_configuration()
+                
+                # Step 4: Restore relay states
+                if relay_states_before and self.temp_control_controller:
+                    print("\n[Step 4/4] Restoring relay states...")
+                    try:
+                        if relay_states_before.get("HEAT"):
+                            self.temp_control_controller.set_heating(True)
+                        if relay_states_before.get("COOL"):
+                            self.temp_control_controller.set_cooling(True)
+                        if relay_states_before.get("BHEAT"):
+                            self.temp_control_controller.set_buffer_heating(True)
+                        if relay_states_before.get("BCOOL"):
+                            self.temp_control_controller.set_buffer_cooling(True)
+                        print(f"✓ Relay states restored: {relay_states_before}")
+                    except Exception as relay_error:
+                        print(f"⚠️ Warning: Failed to restore relay states: {relay_error}")
+                else:
+                    print("\n[Step 4/4] No relay states to restore")
+                
+                print("\n" + "="*60)
+                print("✅ TC-08 AUTO-RECONNECTION SUCCESSFUL")
+                print("="*60 + "\n")
+                
+            else:
+                print("❌ TC-08 reconnection failed")
+                self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="red")
+                print("\n" + "="*60)
+                print("⚠️ TC-08 AUTO-RECONNECTION FAILED")
+                print("Manual intervention may be required")
+                print("="*60 + "\n")
+                
+        except Exception as e:
+            print(f"\n❌ Exception during reconnection: {e}")
+            self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="red")
+            print("\n" + "="*60)
+            print("⚠️ TC-08 AUTO-RECONNECTION FAILED")
+            print(f"Exception: {e}")
+            print("="*60 + "\n")
+        
+        finally:
+            self.tc08_reconnection_in_progress = False
     
     def disconnect_tc08(self):
         """Disconnect from TC-08"""
@@ -2030,10 +2172,16 @@ class ShuttleboxGUI:
                 try:
                     self.update_temperature_plot()
                 except RuntimeError as e:
-                    # TC-08 communication failure
-                    print(f"TC-08 communication error: {e}")
+                    # TC-08 communication failure - attempt auto-reconnection if enabled
+                    print(f"❌ TC-08 RuntimeError: {e}")
                     self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="red")
-                    self.plotting_active = False
+                    
+                    if self.tc08_auto_reconnect_enabled:
+                        print("Attempting auto-reconnection due to RuntimeError...")
+                        self._attempt_tc08_auto_reconnect()
+                    else:
+                        print("Auto-reconnection disabled - stopping plotting")
+                        self.plotting_active = False
                 except Exception as e:
                     print(f"Unexpected error updating temperature plot: {e}")
             
@@ -2327,9 +2475,34 @@ class ShuttleboxGUI:
             # Check if all readings failed (sign of USB communication failure)
             valid_readings = sum(1 for r in readings.values() if not r.error)
             if valid_readings == 0 and len(readings) > 0:
-                print("Warning: TC-08 returned no valid readings - possible USB communication degradation")
-                self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="orange")
+                # Graduated response based on consecutive failure count
+                failures = self.tc08_controller.consecutive_read_failures
+                
+                if failures == 1:
+                    # First failure - just note it (likely transient EMI spike)
+                    print("TC-08 missed reading (likely transient EMI spike)")
+                    self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="green")
+                elif failures < self.tc08_failure_threshold:
+                    # Multiple failures but below threshold - monitor closely
+                    print(f"⚠️ TC-08 consecutive failures: {failures}/{self.tc08_failure_threshold}")
+                    self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="yellow")
+                else:
+                    # Threshold reached - attempt auto-reconnection if enabled
+                    print(f"❌ TC-08 failure threshold reached: {failures} consecutive failures")
+                    self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="orange")
+                    
+                    if self.tc08_auto_reconnect_enabled:
+                        print("Auto-reconnection enabled - attempting reconnection...")
+                        self._attempt_tc08_auto_reconnect()
+                    else:
+                        print("Auto-reconnection disabled - manual intervention required")
+                
                 return
+            
+            # If we got valid readings, ensure status is green
+            if valid_readings > 0:
+                self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="green")
+            
             current_time = datetime.now()
             
             # Get plot period from user input
