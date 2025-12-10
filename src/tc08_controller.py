@@ -79,6 +79,27 @@ class TC08Controller:
             'S': ctypes.c_int8(83), 'T': ctypes.c_int8(84)
         }
         
+        # TC-08 error code mapping (from programmer's guide)
+        self._error_codes = {
+            -1: "INVALID_HANDLE",
+            0: "OK - No error occurred",
+            1: "OS_NOT_SUPPORTED - Driver does not support current OS",
+            2: "NO_CHANNELS_SET - Call to usb_tc08_set_channel required",
+            3: "INVALID_PARAMETER - One or more function arguments invalid",
+            4: "VARIANT_NOT_SUPPORTED - Hardware version not supported",
+            5: "INCORRECT_MODE - Incompatible mix of legacy/non-legacy functions",
+            6: "ENUMERATION_INCOMPLETE - Background enumeration in progress",
+            7: "NOT_RESPONDING - Cannot get reply from USB TC-08",
+            8: "FW_FAIL - Unable to download firmware",
+            9: "CONFIG_FAIL - Missing or corrupted EEPROM",
+            10: "NOT_FOUND - Cannot find enumerated device",
+            11: "THREAD_FAIL - Threading function failed",
+            12: "PIPE_INFO_FAIL - Cannot get USB pipe information",
+            13: "NOT_CALIBRATED - No calibration date found",
+            14: "PICOPP_TOO_OLD - Old picopp.sys driver found",
+            15: "COMMUNICATION - PC lost communication with device"
+        }
+        
         # Validate configuration
         self._validate_config()
     
@@ -95,6 +116,55 @@ class TC08Controller:
         
         if self.config.sample_interval_ms < 100:
             raise ValueError("Sample interval must be at least 100ms")
+    
+    def get_last_error(self) -> Dict[str, any]:
+        """Get last error from TC-08 device with detailed diagnostic information
+        
+        Returns:
+            Dictionary with error_code, error_name, and error_description
+        """
+        try:
+            if not self.connected or self.chandle.value == 0:
+                return {
+                    'error_code': -1,
+                    'error_name': 'INVALID_HANDLE',
+                    'error_description': 'Device not connected or invalid handle'
+                }
+            
+            # Call TC-08 API to get last error
+            error_code = tc08.usb_tc08_get_last_error(self.chandle.value)
+            
+            # Look up error description
+            error_description = self._error_codes.get(error_code, f"UNKNOWN_ERROR_{error_code}")
+            
+            # Extract just the error name (before the dash)
+            error_name = error_description.split(' - ')[0] if ' - ' in error_description else error_description
+            
+            error_info = {
+                'error_code': error_code,
+                'error_name': error_name,
+                'error_description': error_description,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            # Log to health monitor if error is not OK
+            if error_code != 0:
+                logger.warning(f"TC-08 Error {error_code}: {error_description}")
+                self.health_monitor.log_error(
+                    f"TC-08 API Error: {error_description}",
+                    error_info
+                )
+            
+            return error_info
+            
+        except Exception as e:
+            logger.error(f"Failed to get TC-08 last error: {e}")
+            return {
+                'error_code': -999,
+                'error_name': 'EXCEPTION',
+                'error_description': f'Exception during get_last_error: {str(e)}',
+                'timestamp': datetime.now().isoformat()
+            }
     
     def connect(self) -> bool:
         """Connect to TC-08 device and configure channels"""
@@ -254,8 +324,23 @@ class TC08Controller:
                 self.total_read_failures += 1
                 self.last_failed_read = timestamp
                 
+                # Get detailed error diagnostics
+                error_info = self.get_last_error()
+                
                 logger.warning(f"TC-08 missed reading #{self.consecutive_read_failures} "
                              f"(total: {self.total_read_failures}) - all channels unavailable")
+                logger.warning(f"TC-08 Error: {error_info['error_description']}")
+                
+                # Log to health monitor with error diagnostics
+                self.health_monitor.log_error(
+                    f"All channels failed (#{self.consecutive_read_failures})",
+                    {
+                        'consecutive_failures': self.consecutive_read_failures,
+                        'total_failures': self.total_read_failures,
+                        'error_diagnostics': error_info,
+                        'channels': self.config.channels
+                    }
+                )
             else:
                 # At least some channels worked - reset consecutive counter
                 if self.consecutive_read_failures > 0:
@@ -538,8 +623,14 @@ class TC08HealthMonitor:
                     if min_interval == 0:
                         health_data['usb_communication'] = 'DEGRADED - device not responding properly'
                         logger.warning("TC-08 USB communication degradation detected (min_interval=0)")
+                        
+                        # Get detailed error diagnostics
+                        error_info = controller_instance.get_last_error()
+                        health_data['last_error_diagnostics'] = error_info
+                        logger.warning(f"TC-08 Error Diagnostics: {error_info['error_description']}")
                     else:
                         health_data['usb_communication'] = 'OK'
+                        health_data['last_error_diagnostics'] = None
                 except Exception as e:
                     health_data['usb_communication'] = f'FAILED: {str(e)}'
                     health_data['min_interval_response'] = None
