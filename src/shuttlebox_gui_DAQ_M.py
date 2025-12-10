@@ -416,10 +416,10 @@ class ShuttleboxGUI:
         
         # TC-08 auto-reconnection settings
         self.tc08_auto_reconnect_enabled = True
-        self.tc08_failure_threshold = 5  # Reconnect after 5 consecutive failures
+        self.tc08_failure_threshold = 1  # Reconnect after 1 failure (fixes min_interval_response)
         self.tc08_reconnection_in_progress = False
         self.tc08_last_reconnection_attempt = None
-        self.tc08_reconnection_cooldown = 5  # Wait 5 seconds between reconnection attempts
+        self.tc08_reconnection_cooldown = 30  # Wait 30 seconds between reconnection attempts
         
         self.create_widgets()
         self.refresh_com_ports()  # Initialize COM port lists
@@ -553,7 +553,7 @@ class ShuttleboxGUI:
                        command=self._update_auto_reconnect_setting).pack(side=tk.LEFT)
         
         ttk.Label(reconnect_frame, text="Threshold:").pack(side=tk.LEFT, padx=(10, 2))
-        self.failure_threshold_var = tk.StringVar(value="5")
+        self.failure_threshold_var = tk.StringVar(value="1")
         threshold_entry = ttk.Entry(reconnect_frame, textvariable=self.failure_threshold_var, width=4)
         threshold_entry.pack(side=tk.LEFT)
         threshold_entry.bind('<FocusOut>', lambda e: self._update_auto_reconnect_setting())
@@ -910,8 +910,8 @@ class ShuttleboxGUI:
         try:
             self.tc08_failure_threshold = int(self.failure_threshold_var.get())
         except ValueError:
-            self.tc08_failure_threshold = 5  # Default fallback
-            self.failure_threshold_var.set("5")
+            self.tc08_failure_threshold = 1  # Default fallback
+            self.failure_threshold_var.set("1")
     
     def refresh_com_ports(self):
         """Refresh available COM ports and DAQ devices in dropdown menus"""

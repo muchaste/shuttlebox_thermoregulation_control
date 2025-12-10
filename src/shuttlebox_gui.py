@@ -400,10 +400,10 @@ class ShuttleboxGUI:
         
         # TC-08 auto-reconnection settings
         self.tc08_auto_reconnect_enabled = True
-        self.tc08_failure_threshold = 5  # Reconnect after 5 consecutive failures
+        self.tc08_failure_threshold = 1  # Reconnect after 1 failure (fixes min_interval_response)
         self.tc08_reconnection_in_progress = False
         self.tc08_last_reconnection_attempt = None
-        self.tc08_reconnection_cooldown = 5  # Wait 5 seconds between reconnection attempts
+        self.tc08_reconnection_cooldown = 30  # Wait 30 seconds between reconnection attempts
         
         self.create_widgets()
         self.refresh_com_ports()  # Initialize COM port lists
@@ -537,7 +537,7 @@ class ShuttleboxGUI:
                        command=self._update_auto_reconnect_setting).pack(side=tk.LEFT)
         
         ttk.Label(reconnect_frame, text="Threshold:").pack(side=tk.LEFT, padx=(10, 2))
-        self.failure_threshold_var = tk.StringVar(value="5")
+        self.failure_threshold_var = tk.StringVar(value="1")
         threshold_entry = ttk.Entry(reconnect_frame, textvariable=self.failure_threshold_var, width=4)
         threshold_entry.pack(side=tk.LEFT)
         threshold_entry.bind('<FocusOut>', lambda e: self._update_auto_reconnect_setting())
@@ -2425,7 +2425,6 @@ class ShuttleboxGUI:
             if not self.tc08_controller.connected:
                 print("TC-08 connection lost - stopping temperature plotting")
                 self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="orange")
-                self._attempt_tc08_auto_reconnect()
                 return
             
             readings = self.tc08_controller.read_temperatures()
@@ -2433,29 +2432,38 @@ class ShuttleboxGUI:
             # Check if all readings failed (sign of USB communication failure)
             valid_readings = sum(1 for r in readings.values() if not r.error)
             if valid_readings == 0 and len(readings) > 0:
-                # Single missed reading - tolerate but track
-                failures = self.tc08_controller.consecutive_read_failures
-                total = self.tc08_controller.total_read_failures
-                
-                if failures == 1:
-                    # First failure - just log, don't alarm user
-                    print(f"TC-08 missed reading (likely transient EMI spike) - using last known values")
-                elif failures < self.tc08_failure_threshold:
-                    # Multiple failures but below threshold
-                    print(f"TC-08 consecutive failures: {failures}/{self.tc08_failure_threshold} - monitoring...")
-                    self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="yellow")
+                # Graduated response based on consecutive failure count (if attribute exists)
+                if hasattr(self.tc08_controller, 'consecutive_read_failures'):
+                    failures = self.tc08_controller.consecutive_read_failures
+                    
+                    if failures == 1:
+                        # First failure - just note it (likely transient EMI spike)
+                        print("TC-08 missed reading (likely transient EMI spike)")
+                        self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="green")
+                    elif failures < self.tc08_failure_threshold:
+                        # Multiple failures but below threshold - monitor closely
+                        print(f"⚠️ TC-08 consecutive failures: {failures}/{self.tc08_failure_threshold}")
+                        self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="yellow")
+                    else:
+                        # Threshold reached - attempt auto-reconnection if enabled
+                        print(f"❌ TC-08 failure threshold reached: {failures} consecutive failures")
+                        self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="orange")
+                        
+                        if self.tc08_auto_reconnect_enabled:
+                            print("Auto-reconnection enabled - attempting reconnection...")
+                            self._attempt_tc08_auto_reconnect()
+                        else:
+                            print("Auto-reconnection disabled - manual intervention required")
                 else:
-                    # Threshold reached - attempt reconnection
-                    print(f"⚠️  TC-08 failure threshold reached ({failures} consecutive failures)")
+                    # Fallback for older tc08_controller without failure tracking
+                    print("Warning: TC-08 returned no valid readings - possible USB communication degradation")
                     self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="orange")
-                    self._attempt_tc08_auto_reconnect()
                 
-                # Use last known values (already in arrays)
                 return
-            elif valid_readings > 0:
-                # At least some readings succeeded - update status to green
-                if self.tc08_controller.consecutive_read_failures == 0:
-                    self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="green")
+            
+            # If we got valid readings, ensure status is green
+            if valid_readings > 0:
+                self.tc08_status_canvas.itemconfig(self.tc08_status_circle, fill="green")
             current_time = datetime.now()
             
             # Get plot period from user input
